@@ -24,6 +24,7 @@ void __wrap_abort(void);
 #define HAVE_BUILTIN_POPCOUNT 1
 #include "../components/libwally-core/upstream/src/amalgamation/combined.c"
 
+#include "./anti_exfil.c"
 #include "./aes.c"
 #include "./assets.c"
 #include "./attestation/attestation.c"
