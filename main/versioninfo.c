@@ -52,9 +52,9 @@ void build_version_info_reply(const void* ctx, CborEncoder* container)
     const jade_msg_source_t* const source = (const jade_msg_source_t*)ctx;
 
 #ifdef CONFIG_DEBUG_MODE
-    const uint8_t num_version_fields = 23;
+    const uint8_t num_version_fields = 24;
 #else
-    const uint8_t num_version_fields = 16;
+    const uint8_t num_version_fields = 17;
 #endif
 
     CborEncoder map_encoder;
@@ -63,6 +63,7 @@ void build_version_info_reply(const void* ctx, CborEncoder* container)
 
     add_string_to_map(&map_encoder, "JADE_VERSION", running_app_info.version);
     add_uint_to_map(&map_encoder, "JADE_OTA_MAX_CHUNK", JADE_OTA_BUF_SIZE);
+    add_boolean_to_map(&map_encoder, "JADE_TAPROOT_ANTI_EXFIL", true);
 
     // Config - eg. ble/radio enabled in build, or not
     // defined in ota_defines.h

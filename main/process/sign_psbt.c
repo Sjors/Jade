@@ -1,4 +1,5 @@
 #ifndef AMALGAMATED_BUILD
+#include "../anti_exfil.h"
 #include "../button_events.h"
 #include "../descriptor.h"
 #include "../jade_assert.h"
@@ -716,6 +717,151 @@ network_t network_from_psbt_type(struct wally_psbt* psbt)
 
 // Sign a psbt/pset - the passed wally psbt struct is updated with any signatures.
 // Returns 0 if no errors occurred - does not necessarily indicate that signatures were added.
+/* Experimental BIP-EXFIL PSBT namespace: fc 02 'a' 'e' subtype output-key.
+ * Keep this separate from the existing ECDSA sign-to-contract protocol. */
+static bool ae_psbt_namespace(const struct wally_map_item* item)
+{
+    if (!item->key || item->key_len < 4 || item->key[0] != 0xfc) {
+        return false;
+    }
+    size_t offset = 2;
+    uint64_t len = item->key[1];
+    if (len >= 0xfd) {
+        const size_t size = len == 0xfd ? 2 : len == 0xfe ? 4 : 8;
+        if (item->key_len < size + 2) {
+            return false;
+        }
+        len = 0;
+        for (size_t i = 0; i < size; ++i) {
+            len |= (uint64_t)item->key[2 + i] << (8 * i);
+        }
+        offset += size;
+    }
+    return len == 2 && item->key_len >= offset + 2 && item->key[offset] == 'a' && item->key[offset + 1] == 'e';
+}
+
+static bool ae_psbt_map_has_fields(const struct wally_map* map)
+{
+    for (size_t i = 0; i < map->num_items; ++i) {
+        if (ae_psbt_namespace(&map->items[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Return -1 for malformed fields, 0 for no request, or the protocol round.
+ * The first implementation requires all inputs to belong to this signer and to
+ * carry anti-exfil requests, so an AE invocation cannot release other signatures. */
+static int ae_psbt_input_round(const struct wally_psbt_input* input,
+    const unsigned char output_key[32], const struct wally_map_item* fields[3])
+{
+    memset(fields, 0, 3 * sizeof(*fields));
+    for (size_t i = 0; i < input->unknowns.num_items; ++i) {
+        const struct wally_map_item* item = &input->unknowns.items[i];
+        if (!ae_psbt_namespace(item)) {
+            continue;
+        }
+        if (item->key_len != 37 || item->key[1] != 2 || item->key[4] > 2
+            || memcmp(item->key + 5, output_key, 32) != 0) {
+            return -1;
+        }
+        const size_t subtype = item->key[4];
+        if (fields[subtype] || item->value_len != (subtype == 1 ? 33 : 32)) {
+            return -1;
+        }
+        fields[subtype] = item;
+    }
+    if (!fields[0] && !fields[1] && !fields[2]) {
+        return 0;
+    }
+    for (size_t i = 0; i < input->taproot_leaf_hashes.num_items; ++i) {
+        if (input->taproot_leaf_hashes.items[i].value_len) {
+            return -1; // Script-path derivations are outside this protocol implementation.
+        }
+    }
+    if (!fields[0] || (!fields[1] != !fields[2]) || input->signatures.num_items
+        || input->taproot_leaf_signatures.num_items || input->taproot_leaf_scripts.num_items
+        || input->final_witness || wally_map_get_integer(&input->psbt_fields, 0x07)
+        || wally_map_get_integer(&input->psbt_fields, 0x08)
+        || wally_map_get_integer(&input->psbt_fields, 0x13)
+        || wally_map_get_integer(&input->psbt_fields, 0x18) || input->sighash > 1) {
+        return -1;
+    }
+    return fields[2] ? 2 : 1;
+}
+
+static int ae_psbt_round(struct wally_psbt* psbt)
+{
+    if (ae_psbt_map_has_fields(&psbt->unknowns)) {
+        return -1;
+    }
+    for (size_t i = 0; i < psbt->num_outputs; ++i) {
+        if (ae_psbt_map_has_fields(&psbt->outputs[i].unknowns)) {
+            return -1;
+        }
+    }
+    bool requested = false;
+    for (size_t i = 0; i < psbt->num_inputs; ++i) {
+        requested |= ae_psbt_map_has_fields(&psbt->inputs[i].unknowns);
+    }
+    if (!requested) {
+        return 0;
+    }
+    int round = 0;
+    key_iter iter;
+    for (size_t i = 0; i < psbt->num_inputs; ++i) {
+        const struct wally_tx_output* utxo = NULL;
+        const struct wally_map_item* fields[3];
+        if (wally_psbt_get_input_best_utxo(psbt, i, &utxo) != WALLY_OK || !utxo || utxo->script_len != 34
+            || utxo->script[0] != 0x51 || utxo->script[1] != 0x20
+            || !key_iter_input_begin_public(psbt, i, &iter) || !iter.is_taproot
+            || key_iter_get_num_keys(&iter) != 1) {
+            return -1;
+        }
+        const int input_round = ae_psbt_input_round(&psbt->inputs[i], utxo->script + 2, fields);
+        if (input_round < 1 || (round && round != input_round)) {
+            return -1;
+        }
+        round = input_round;
+    }
+    return round;
+}
+
+static bool ae_psbt_sign_input(struct wally_psbt* psbt, size_t index, const key_iter* iter,
+    const unsigned char txhash[32], int round)
+{
+    struct wally_psbt_input* input = &psbt->inputs[index];
+    const struct wally_tx_output* utxo = NULL;
+    const struct wally_map_item* fields[3];
+    unsigned char secret[32], pubkey[33], nonce[33], signature[65], nonce_key[37];
+    const secp256k1_context* ctx = wally_get_secp_context();
+    bool ok = wally_psbt_get_input_best_utxo(psbt, index, &utxo) == WALLY_OK && utxo
+        && ae_psbt_input_round(input, utxo->script + 2, fields) == round
+        && wally_ec_private_key_bip341_tweak(iter->hdkey.priv_key + 1, 32, NULL, 0, 0, secret, 32) == WALLY_OK
+        && wally_ec_public_key_from_private_key(secret, 32, pubkey, sizeof(pubkey)) == WALLY_OK
+        && memcmp(pubkey + 1, utxo->script + 2, 32) == 0;
+    if (ok && round == 1) {
+        ok = jade_anti_exfil_commit(ctx, nonce, secret, txhash, fields[0]->value);
+        if (ok) {
+            memcpy(nonce_key, fields[0]->key, sizeof(nonce_key));
+            nonce_key[4] = 1;
+            ok = wally_map_add(&input->unknowns, nonce_key, sizeof(nonce_key), nonce, sizeof(nonce)) == WALLY_OK;
+        }
+    } else if (ok) {
+        ok = jade_anti_exfil_sign(ctx, signature, secret, txhash, fields[0]->value, fields[1]->value, fields[2]->value);
+        if (ok) {
+            size_t sig_len = 64;
+            if (input->sighash) {
+                signature[sig_len++] = input->sighash;
+            }
+            ok = wally_psbt_input_set_taproot_signature(input, signature, sig_len) == WALLY_OK;
+        }
+    }
+    sodium_memzero(secret, sizeof(secret));
+    return ok;
+}
+
 // Returns an rpc/message error code on error, and the error string should be populated.
 int sign_psbt(jade_process_t* process, CborValue* params, const network_t network_id, struct wally_psbt* psbt,
     const char** errmsg)
@@ -732,6 +878,11 @@ int sign_psbt(jade_process_t* process, CborValue* params, const network_t networ
         return CBOR_RPC_BAD_PARAMETERS;
     }
     const bool for_liquid = is_elements;
+    const int anti_exfil_round = ae_psbt_round(psbt);
+    if (anti_exfil_round < 0 || (anti_exfil_round && for_liquid)) {
+        *errmsg = "Invalid or unsupported anti-exfil request";
+        return CBOR_RPC_BAD_PARAMETERS;
+    }
     // Liquid: Optional ELIP-0101 genesis blockhash can override test network defaults.
     // Defers to params_genesis_hash() for validation (only needed for Lisuid/PSET).
     size_t has_genesis_blockhash = 0;
@@ -1101,9 +1252,11 @@ int sign_psbt(jade_process_t* process, CborValue* params, const network_t networ
         while (iter.is_valid) {
             // Sign the input with this key
             const uint32_t sign_flags = EC_FLAG_GRIND_R | (for_liquid ? EC_FLAG_ELEMENTS : 0);
-            if (wally_psbt_sign_input_bip32(
-                    psbt, index, iter.key_index, txhash, sizeof(txhash), &iter.hdkey, sign_flags)
-                != WALLY_OK) {
+            const bool signed_ok = anti_exfil_round
+                ? ae_psbt_sign_input(psbt, index, &iter, txhash, anti_exfil_round)
+                : wally_psbt_sign_input_bip32(
+                      psbt, index, iter.key_index, txhash, sizeof(txhash), &iter.hdkey, sign_flags) == WALLY_OK;
+            if (!signed_ok) {
                 *errmsg = "Failed to generate signature";
                 retval = CBOR_RPC_INTERNAL_ERROR;
                 goto cleanup;

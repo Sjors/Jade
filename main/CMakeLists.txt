@@ -29,12 +29,13 @@ endif()
 if(CONFIG_AMALGAMATED_BUILD)
     set(wallydir "${PROJECT_DIR}/components/libwally-core")
     list(APPEND wallydirs "${wallydir}" "${wallydir}/upstream" "${wallydir}/upstream/src" "${wallydir}/upstream/src/ccan")
-    set(secpdir "${wallydir}/upstream/src/secp256k1/include")
 endif()
 
 if(CONFIG_LOG_WIFI)
     list(APPEND extra_priv_requires "esp_wifi")
 endif()
+
+set(secpdir "${PROJECT_DIR}/components/libwally-core/upstream/src/secp256k1/include")
 
 idf_component_register(SRC_DIRS "."
                                 "attestation"
